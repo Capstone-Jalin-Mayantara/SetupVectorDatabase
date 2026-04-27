@@ -1,0 +1,24 @@
+profiling_task:
+  description: >
+    Baca dan analisis kondisi siswa berikut: {profil_siswa}.
+    Berdasarkan kondisi tersebut, buatlah strategi adaptasi materi yang spesifik. Tentukan aturan penulisan teks, panjang paragraf, dan instruksi visual yang diperlukan.
+  expected_output: >
+    Dokumen strategi adaptasi materi (bullet points) yang berisi panduan penulisan teks untuk siswa dengan kondisi tersebut.
+  agent: profiling_agent
+
+adaptive_task:
+  description: >
+    Gunakan dokumen strategi dari tugas sebelumnya sebagai pedoman mutlak.
+    Sekarang, baca materi pembelajaran mentah berikut: "{materi_mentah}".
+    Tulis ulang, sederhanakan, dan adaptasi materi tersebut agar mematuhi strategi yang telah dibuat.
+  expected_output: >
+    Teks materi pembelajaran final yang sudah disederhanakan, terstruktur rapi, dan siap diberikan langsung kepada siswa.
+  agent: adaptive_agent
+
+insight_task:
+  description: >
+    Evaluasi teks materi pembelajaran final yang dihasilkan dari tugas sebelumnya.
+    Berikan perkiraan "Readability Score" (Skor 0-100) dan nilai apakah teks tersebut sudah memenuhi standar inklusivitas[cite: 1501]. Jika ada kata atau kalimat yang masih terlalu rumit, sebutkan dan berikan saran perbaikannya.
+  expected_output: >
+    Laporan audit akhir yang berisi: Skor Inklusivitas, analisis kelebihan teks, dan rekomendasi perbaikan (jika ada).
+  agent: insight_agent
