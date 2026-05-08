@@ -4,6 +4,7 @@ profiling_task:
     Berdasarkan kondisi tersebut, buatlah strategi adaptasi materi yang spesifik. Tentukan aturan penulisan teks, panjang paragraf, dan instruksi visual yang diperlukan.
   expected_output: >
     Dokumen strategi adaptasi materi (bullet points) yang berisi panduan penulisan teks untuk siswa dengan kondisi tersebut.
+    Ringkas output maksimal 200 kata.
   agent: profiling_agent
 
 adaptive_task:

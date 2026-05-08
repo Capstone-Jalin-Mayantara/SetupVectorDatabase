@@ -2,4 +2,16 @@ python-dotenv
 langchain-chroma
 langchain-google-genai
 langchain-core
+langchain-huggingface
+langchain-community
+langchain-text-splitters
+sentence-transformers
 crewai
+psycopg2-binary
+pgvector
+redis
+reportlab
+python-docx
+pdfplumber
+python-docx
+pdfplumber

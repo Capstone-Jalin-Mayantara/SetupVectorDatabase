@@ -1,21 +1,23 @@
 import os
-from dotenv import load_dotenv
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_core.documents import Document
 
-# 1. LOAD DAN VALIDASI API KEY
-# Ini akan mencegah error jika file .env belum terbaca
-load_dotenv()
-if not os.environ.get("GOOGLE_API_KEY"):
-    raise ValueError("🚨 ERROR: GOOGLE_API_KEY tidak ditemukan! Pastikan file .env sudah di-save dan formatnya benar.")
+MODEL_NAME = "intfloat/multilingual-e5-base"
+DB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "database", "chroma_db")
 
-# 2. INISIALISASI EMBEDDING GEMINI
-# Kita menggunakan penulisan model terbaru tanpa awalan "models/"
-print("⏳ Menyiapkan Gemini Embeddings...")
-embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
+# 1. INISIALISASI EMBEDDING (prefix "passage:" wajib untuk model e5 saat indexing)
+print(f"⏳ Menyiapkan HuggingFace Embeddings ({MODEL_NAME}) di CUDA...")
+embeddings_index = HuggingFaceEmbeddings(
+    model_name=MODEL_NAME,
+    model_kwargs={"device": "cuda"},
+    encode_kwargs={
+        "normalize_embeddings": True,
+        "prompt": "passage: "
+    }
+)
 
-# 3. SIAPKAN DOKUMEN REFERENSI (KNOWLEDGE BASE)
+# 2. SIAPKAN DOKUMEN REFERENSI (KNOWLEDGE BASE)
 dokumen_referensi = [
     Document(
         page_content="Panduan Aksesibilitas WCAG: Teks untuk siswa Disleksia harus menggunakan kalimat pendek, maksimal 10-15 kata per kalimat. Hindari penggunaan kata majemuk yang rumit. Gunakan poin-poin (bullet points) untuk instruksi.",
@@ -27,22 +29,32 @@ dokumen_referensi = [
     )
 ]
 
-# 4. BUAT DAN SIMPAN KE CHROMADB LOKAL
-# Pastikan folder database dibuat di tempat yang benar
-lokasi_db = os.path.join(os.path.dirname(__file__), "database", "chroma_db")
-os.makedirs(lokasi_db, exist_ok=True)
-
-print(f"📁 Menyimpan dokumen ke Vector Database di: {lokasi_db}")
-vectorstore = Chroma.from_documents(
+# 3. BUAT DAN SIMPAN KE CHROMADB
+os.makedirs(DB_DIR, exist_ok=True)
+print(f"📁 Menyimpan dokumen ke Vector Database di: {DB_DIR}")
+Chroma.from_documents(
     documents=dokumen_referensi,
-    embedding=embeddings,
-    persist_directory=lokasi_db
+    embedding=embeddings_index,
+    persist_directory=DB_DIR
 )
 
-# 5. TES PENCARIAN (RETRIEVAL)
+# 4. TES RETRIEVAL — gunakan prefix "query:" saat mencari (berbeda dari "passage:")
 print("\n🔍 --- Tes Retrieval (RAG) ---")
+embeddings_query = HuggingFaceEmbeddings(
+    model_name=MODEL_NAME,
+    model_kwargs={"device": "cuda"},
+    encode_kwargs={
+        "normalize_embeddings": True,
+        "prompt": "query: "
+    }
+)
+vectorstore_query = Chroma(
+    persist_directory=DB_DIR,
+    embedding_function=embeddings_query
+)
+
 query = "Bagaimana aturan menulis teks untuk siswa disleksia?"
-hasil_pencarian = vectorstore.similarity_search(query, k=1)
+hasil_pencarian = vectorstore_query.similarity_search(query, k=1)
 
 print(f"Pertanyaan: {query}")
 print(f"Hasil dari Database: {hasil_pencarian[0].page_content}")

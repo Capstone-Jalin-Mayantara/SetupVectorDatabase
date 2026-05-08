@@ -17,8 +17,18 @@ env/
 dist/
 build/
 
-# Output files
-Laporan_Akhir_ASIQ.md
+# Generated output
+output/
+*.pdf
+
+# Input documents
+input/
+
+# Source knowledge documents (PDF pedoman, besar)
+knowledge/
+
+# Notes & docs lokal
+huggingface.md
 
 # IDE
 .vscode/
