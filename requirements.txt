@@ -13,5 +13,7 @@ redis
 reportlab
 python-docx
 pdfplumber
-python-docx
-pdfplumber
+fastapi
+uvicorn[standard]
+python-multipart
+boto3
