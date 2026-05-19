@@ -1,5 +1,6 @@
 import os
 import time
+import logging
 from dotenv import load_dotenv
 from crewai import Agent, Crew, LLM, Process, Task
 from crewai.project import CrewBase, agent, crew, task
@@ -10,28 +11,65 @@ from db_connection import REDIS_ENABLED, redis_client
 
 load_dotenv(override=True)
 
+log = logging.getLogger("asiq.crew")
+
 MODEL_NAME = "intfloat/multilingual-e5-base"
 DB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "database", "chroma_db")
 CACHE_TTL = 3600  # 1 jam
+
+# Delay antar task/step — turunkan jika Groq plan sudah tier berbayar
+_TASK_DELAY  = int(os.getenv("GROQ_TASK_DELAY",  "30"))   # detik antar task (default 30, was 60)
+_STEP_DELAY  = int(os.getenv("GROQ_STEP_DELAY",  "8"))    # detik antar step (default 8, was 30)
+_MAX_RETRIES = int(os.getenv("GROQ_MAX_RETRIES", "3"))    # retry jika rate-limited
 
 local_llm = LLM(
     model="groq/openai/gpt-oss-120b",
     api_key=os.environ.get("GROQ_API_KEY"),
 )
 
-# Load ChromaDB dengan prefix "query:" — dipakai saat agent mencari pedoman
-_embeddings_query = HuggingFaceEmbeddings(
-    model_name=MODEL_NAME,
-    model_kwargs={"device": "cuda"},
-    encode_kwargs={
-        "normalize_embeddings": True,
-        "prompt": "query: "
-    }
-)
-_vectorstore = Chroma(
-    persist_directory=DB_DIR,
-    embedding_function=_embeddings_query
-)
+# Singleton embedding model — di-load sekali saat modul pertama kali diimport.
+# Hindari reload berulang yang memakan waktu 15-30 detik per request.
+_embeddings_query: HuggingFaceEmbeddings | None = None
+_vectorstore: Chroma | None = None
+
+
+def _get_vectorstore() -> Chroma:
+    global _embeddings_query, _vectorstore
+    if _vectorstore is None:
+        device = "cuda" if _cuda_available() else "cpu"
+        log.info("Memuat embedding model '%s' di device '%s'...", MODEL_NAME, device)
+        _embeddings_query = HuggingFaceEmbeddings(
+            model_name=MODEL_NAME,
+            model_kwargs={"device": device},
+            encode_kwargs={"normalize_embeddings": True, "prompt": "query: "},
+        )
+        _vectorstore = Chroma(
+            persist_directory=DB_DIR,
+            embedding_function=_embeddings_query,
+        )
+        log.info("Vectorstore ChromaDB siap.")
+    return _vectorstore
+
+
+def _cuda_available() -> bool:
+    try:
+        import torch
+        return torch.cuda.is_available()
+    except ImportError:
+        return False
+
+
+def _task_callback(_task_output):
+    """Delay antar task untuk menghindari throttle Groq API."""
+    if _TASK_DELAY > 0:
+        log.debug("Task selesai — tunggu %ds sebelum task berikutnya.", _TASK_DELAY)
+        time.sleep(_TASK_DELAY)
+
+
+def _step_callback(_step_output):
+    """Delay antar step di dalam satu task."""
+    if _STEP_DELAY > 0:
+        time.sleep(_STEP_DELAY)
 
 
 # ── TOOLS ────────────────────────────────────────────────────────────────────
@@ -43,7 +81,7 @@ def cari_pedoman(query: str) -> str:
     strategi adaptasi materi, atau penilaian aksesibilitas."""
     if isinstance(query, dict):
         query = query.get("description") or query.get("query") or str(query)
-    hasil = _vectorstore.similarity_search(query, k=1)
+    hasil = _get_vectorstore().similarity_search(query, k=1)
     if not hasil:
         return "Tidak ditemukan dokumen relevan untuk query ini."
     return "\n\n---\n\n".join(
@@ -91,11 +129,13 @@ class AsiqAgents():
 
     @agent
     def profiling_agent(self) -> Agent:
+        # cek_cache_profiling dipanggil PERTAMA — jika cache hit, tidak perlu panggil LLM lagi.
+        # simpan_cache_profiling dipanggil di AKHIR untuk menyimpan strategi baru ke Redis.
         return Agent(
             config=self.agents_config['profiling_agent'],
             llm=local_llm,
-            tools=[cari_pedoman],
-            verbose=True
+            tools=[cek_cache_profiling, cari_pedoman, simpan_cache_profiling],
+            verbose=True,
         )
 
     @agent
@@ -104,16 +144,17 @@ class AsiqAgents():
             config=self.agents_config['adaptive_agent'],
             llm=local_llm,
             tools=[cari_pedoman],
-            verbose=True
+            verbose=True,
         )
 
     @agent
     def insight_agent(self) -> Agent:
+        # Insight agent hanya evaluasi — tidak butuh tool agar tidak looping.
         return Agent(
             config=self.agents_config['insight_agent'],
             llm=local_llm,
             tools=[],
-            verbose=True
+            verbose=True,
         )
 
     @task
@@ -135,6 +176,25 @@ class AsiqAgents():
             tasks=self.tasks,
             process=Process.sequential,
             verbose=True,
-            task_callback=lambda _: time.sleep(60),
-            step_callback=lambda _: time.sleep(30),
+            task_callback=_task_callback,
+            step_callback=_step_callback,
         )
+
+
+def run_crew_with_retry(inputs: dict) -> object:
+    """Jalankan crew dengan exponential backoff jika Groq rate-limit (429)."""
+    import random
+    last_exc = None
+    for attempt in range(1, _MAX_RETRIES + 1):
+        try:
+            return AsiqAgents().crew().kickoff(inputs=inputs)
+        except Exception as exc:
+            msg = str(exc).lower()
+            if "rate limit" in msg or "429" in msg or "too many" in msg:
+                wait = (2 ** attempt) + random.uniform(0, 2)
+                log.warning("Rate limit hit (attempt %d/%d). Retry dalam %.1fs...", attempt, _MAX_RETRIES, wait)
+                time.sleep(wait)
+                last_exc = exc
+            else:
+                raise
+    raise RuntimeError(f"Pipeline gagal setelah {_MAX_RETRIES} retry: {last_exc}") from last_exc

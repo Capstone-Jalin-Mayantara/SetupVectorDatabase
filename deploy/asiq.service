@@ -1,0 +1,50 @@
+# Systemd service untuk ASIQ FastAPI server
+# File ini memastikan server otomatis start saat EC2 reboot.
+#
+# CARA INSTALL (jalankan di EC2 sebagai root):
+#   sudo cp /home/ubuntu/SetupVectorDatabase/deploy/asiq.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable asiq
+#   sudo systemctl start asiq
+#
+# Cek status:
+#   sudo systemctl status asiq
+#   sudo journalctl -u asiq -f        ← lihat log real-time
+
+[Unit]
+Description=ASIQ Adaptive Inclusive Learning API
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/SetupVectorDatabase
+
+# Pastikan .env sudah ada di WorkingDirectory
+EnvironmentFile=/home/ubuntu/SetupVectorDatabase/.env
+
+# Path ke virtualenv
+Environment="PATH=/home/ubuntu/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"
+
+# Jalankan uvicorn — 1 worker karena GPU VRAM tidak cukup untuk banyak embedding model
+ExecStart=/home/ubuntu/venv/bin/uvicorn api:app \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --workers 1 \
+    --access-log \
+    --log-level info
+
+# Auto-restart jika crash
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+# Logging ke journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=asiq
+
+[Install]
+WantedBy=multi-user.target
