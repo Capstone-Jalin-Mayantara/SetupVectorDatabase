@@ -55,20 +55,79 @@ def _parse_row(line: str) -> list:
     return [p.strip() for p in parts[1:-1]]
 
 
-# Ganti simbol Unicode ke ASCII supaya Helvetica tidak render kotak hitam
-_UNICODE_MAP = str.maketrans({
-    0x2713: '[v]', 0x2714: '[v]', 0x2705: '[v]',
-    0x2717: '[x]', 0x2718: '[x]', 0x274C: '[x]',
-    0x2192: '->',  0x2190: '<-',  0x21D2: '=>',
-    0x2022: '-',   0x00B7: '-',   0x2023: '-',
+# Sanitasi Unicode untuk PDF.
+# _TYPO_MAP : simbol tipografi → padanan teks (selalu diterapkan).
+# _EMOJI_TXT: fallback emoji → teks, dipakai PER KARAKTER hanya bila
+#             font emoji tidak tersedia atau glyph tidak ada di font.
+#             Bila font emoji (Segoe UI Emoji) terdaftar, emoji dirender
+#             sebagai ikon asli via tag <font> di _clean.
+_TYPO_MAP = str.maketrans({
+    0x2192: '->',   0x2190: '<-',   0x21D2: '=>',   0x21A6: '->',
+    0x2194: '<->',
+    0x2022: '-',    0x00B7: '-',    0x2023: '-',    0x2043: '-',
     0x2026: '...',
-    0x201C: '"',   0x201D: '"',
-    0x2018: "'",   0x2019: "'",
-    0x2014: '--',  0x2013: '-',
-    0x2265: '>=',  0x2264: '<=',  0x2260: '!=',
-    0x00D7: 'x',   0x00F7: '/',   0x00B0: 'deg',
-    0x26A0: '[!]', 0x2B50: '*',
+    0x201C: '"',    0x201D: '"',    0x00AB: '"',    0x00BB: '"',
+    0x2018: "'",    0x2019: "'",    0x02BC: "'",
+    0x2014: '-',    0x2013: '-',    0x2012: '-',
+    0x2011: '-',    0x2212: '-',
+    0x2265: '>=',   0x2264: '<=',   0x2260: '!=',   0x2248: '~=',
+    0x00D7: 'x',    0x00F7: '/',    0x00B0: 'deg',  0x00B2: '2',  0x00B3: '3',
+    0x00A0: ' ',    0x00AD: '',     0x200B: '',     0x200C: '',
+    0x200D: '',     0xFEFF: '',     0xFE0F: '',     0x20E3: '',
 })
+
+_EMOJI_TXT = {
+    0x2713: '[v]',  0x2714: '[v]',  0x2705: '[v]',  0x2611: '[v]',
+    0x2717: '[x]',  0x2718: '[x]',  0x274C: '[x]',  0x2612: '[x]',
+    0x2610: '[ ]',  0x25A1: '[ ]',  0x26A0: '[!]',
+    0x25B6: '>',    0x25C0: '<',    0x25A0: '[#]',
+}
+
+
+# ── Emoji berwarna (Twemoji PNG) ──────────────────────────────────────────────
+# Emoji dirender sebagai gambar PNG berwarna (Twemoji) yang disisipkan inline
+# lewat tag <img> di Paragraph. PNG di-download sekali per emoji lalu di-cache
+# di assets/emoji_cache/ — setelah itu berfungsi offline.
+# Urutan fallback per karakter: PNG berwarna → glyph font emoji (monokrom)
+# → teks ([v], [!], dst.) → dibuang.
+_EMOJI_DIR     = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "assets", "emoji_cache")
+_TWEMOJI_URL   = "https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.1.0/assets/72x72/{}.png"
+_emoji_failed  = set()    # codepoint yang gagal di-download (cache per proses)
+_emoji_netdown = False    # True bila jaringan mati → jangan coba download lagi
+
+
+def _emoji_png(cp: int):
+    """Path PNG Twemoji berwarna untuk satu codepoint, atau None bila tak ada."""
+    global _emoji_netdown
+    if cp in _emoji_failed:
+        return None
+    path = os.path.join(_EMOJI_DIR, f"{cp:x}.png")
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        return path
+    if _emoji_netdown:
+        return None
+    try:
+        import urllib.request
+        os.makedirs(_EMOJI_DIR, exist_ok=True)
+        with urllib.request.urlopen(_TWEMOJI_URL.format(f"{cp:x}"), timeout=6) as r:
+            data = r.read()
+        with open(path, "wb") as fh:
+            fh.write(data)
+        return path
+    except Exception as e:
+        _emoji_failed.add(cp)
+        import urllib.error
+        # HTTPError (404) = emoji memang tak ada di Twemoji; selain itu
+        # anggap jaringan bermasalah → hentikan percobaan download berikutnya
+        if not isinstance(e, urllib.error.HTTPError):
+            _emoji_netdown = True
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            pass
+        return None
 
 
 # ── Document loader ───────────────────────────────────────────────────────────
@@ -246,287 +305,598 @@ def _save_markdown_files(output_dir: str, profiling_out: str, adaptive_out: str,
 # ── PDF Generator ─────────────────────────────────────────────────────────────
 
 def generate_pdf(data: dict, profiling_out: str, adaptive_out: str, insight_out: str, output_dir: str = ".") -> str:
+    """
+    Generate PDF RPP Inklusif.
+    Dicetak ke PDF : Section A (Profil & Strategi) + Section B (Materi Adaptif).
+    Section C (Audit Inklusivitas) TIDAK dicetak — hanya tersedia via API response
+    dan file 03_Laporan_Audit.md.
+    """
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.units import cm
     from reportlab.lib import colors
-    from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_JUSTIFY
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_JUSTIFY, TA_RIGHT
     from reportlab.platypus import (
-        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
+        BaseDocTemplate, Frame, PageTemplate,
+        NextPageTemplate, PageBreak,
+        Paragraph, Spacer, Table, TableStyle, Image,
+        HRFlowable, KeepTogether, Flowable,
     )
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
 
-    nama   = data["nama_siswa"]
-    kelas  = data["kelas"]
-    mapel  = data["mata_pelajaran"]
-    gejala = data["gejala"]
+    # ── Data ─────────────────────────────────────────────────────────────────
+    nama    = data["nama_siswa"]
+    kelas   = data["kelas"]
+    mapel   = data["mata_pelajaran"]
+    gejala  = data["gejala"]
     now     = datetime.now()
     tanggal = now.strftime("%d %B %Y")
     ts      = now.strftime("%Y%m%d_%H%M%S")
-
     filename = os.path.join(output_dir, f"RPP_Inklusif_{nama.replace(' ', '_')}_{ts}.pdf")
 
-    doc = SimpleDocTemplate(
-        filename,
-        pagesize=A4,
-        rightMargin=2 * cm, leftMargin=2 * cm,
-        topMargin=2 * cm,   bottomMargin=2 * cm,
+    # ── Geometri halaman ─────────────────────────────────────────────────────
+    PW, PH = A4
+    MARGIN  = 1.8 * cm
+
+    # ── Asset paths ───────────────────────────────────────────────────────────
+    ASSETS   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+    COVER_BG = os.path.join(ASSETS, "cover_bg.png")
+    HEADER   = os.path.join(ASSETS, "header.png")
+    FOOTER   = os.path.join(ASSETS, "footer.png")
+    LOGO_UB  = os.path.join(ASSETS, "Logo_Universitas_Brawijaya.png")
+    LOGO_FK  = os.path.join(ASSETS, "logo_filkom.png")
+    LOGO_JM  = os.path.join(ASSETS, "logo_jalin-mayantara.png")
+
+    def _img_h(path: str, draw_w: float, default: float) -> float:
+        """Hitung tinggi proporsional gambar pada lebar draw_w."""
+        if not os.path.exists(path):
+            return default
+        try:
+            from PIL import Image as PILImg
+            with PILImg.open(path) as im:
+                iw, ih = im.size
+                return (ih / iw) * draw_w
+        except Exception:
+            return default
+
+    HEADER_H = _img_h(HEADER, PW, 2.4 * cm)
+    FOOTER_H = _img_h(FOOTER, PW, 1.6 * cm)
+
+    # ── Font (coba Unicode TTF, fallback Helvetica) ───────────────────────────
+    FONT_N, FONT_B, FONT_I = "Helvetica", "Helvetica-Bold", "Helvetica-Oblique"
+    _font_candidates = [
+        ("C:/Windows/Fonts/calibri.ttf",  "C:/Windows/Fonts/calibrib.ttf",  "CaliU"),
+        ("C:/Windows/Fonts/arial.ttf",    "C:/Windows/Fonts/arialbd.ttf",   "ArialU"),
+        ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",            "DejaVuU"),
+        ("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+         "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",    "LibU"),
+    ]
+    for _np, _bp, _nm in _font_candidates:
+        if os.path.exists(_np):
+            try:
+                pdfmetrics.registerFont(TTFont(_nm, _np))
+                FONT_N, FONT_I = _nm, _nm
+                if os.path.exists(_bp):
+                    pdfmetrics.registerFont(TTFont(_nm + "B", _bp))
+                    FONT_B = _nm + "B"
+                else:
+                    FONT_B = _nm
+                break
+            except Exception:
+                continue
+
+    # ── Font emoji (untuk render ikon 😊 📚 ⏰ dsb. dari output AI) ──────────
+    FONT_E      = None
+    _EMOJI_CMAP = {}
+    _emoji_candidates = [
+        ("C:/Windows/Fonts/seguiemj.ttf",                              "SegoeEmoji"),
+        ("C:/Windows/Fonts/seguisym.ttf",                              "SegoeSym"),
+        ("/usr/share/fonts/truetype/noto/NotoEmoji-Regular.ttf",       "NotoEmoji"),
+        ("/usr/share/fonts/truetype/ancient-scripts/Symbola_hint.ttf", "Symbola"),
+    ]
+    for _ep, _enm in _emoji_candidates:
+        if os.path.exists(_ep):
+            try:
+                pdfmetrics.registerFont(TTFont(_enm, _ep))
+                FONT_E      = _enm
+                _EMOJI_CMAP = pdfmetrics.getFont(_enm).face.charToGlyph
+                break
+            except Exception:
+                continue
+
+    # ── Warna ─────────────────────────────────────────────────────────────────
+    C_ORANGE  = colors.HexColor("#F5A623")
+    C_ORANGE_L = colors.HexColor("#FFF8EC")
+    C_NAVY    = colors.HexColor("#1B3A6B")
+    C_BLUE    = colors.HexColor("#1565C0")
+    C_DARK    = colors.HexColor("#0D3B86")
+    C_MID     = colors.HexColor("#1976D2")
+    C_LITE    = colors.HexColor("#E3F2FD")
+    C_GRAY    = colors.HexColor("#546E7A")
+    C_GRAYL   = colors.HexColor("#ECEFF1")
+    C_WHITE   = colors.white
+    C_BLACK   = colors.black
+
+    W = PW - 2 * MARGIN  # lebar konten efektif
+
+    # ── Style factory ─────────────────────────────────────────────────────────
+    _base = getSampleStyleSheet()
+
+    def _S(name, **kw) -> ParagraphStyle:
+        return ParagraphStyle(name, parent=_base["Normal"], **kw)
+
+    # Konten
+    S_BODY   = _S("body",   fontName=FONT_N, fontSize=9.5, leading=14,
+                            textColor=C_BLACK, alignment=TA_JUSTIFY, spaceAfter=2)
+    S_BULLET = _S("bullet", fontName=FONT_N, fontSize=9.5, leading=14,
+                            textColor=C_BLACK, leftIndent=14, spaceAfter=1)
+    S_NUM    = _S("num",    fontName=FONT_N, fontSize=9.5, leading=14,
+                            textColor=C_BLACK, leftIndent=22,
+                            firstLineIndent=-22, spaceAfter=1)
+    S_CHECK  = _S("check",  fontName=FONT_N, fontSize=9.5, leading=14,
+                            textColor=C_BLACK, leftIndent=14, spaceAfter=1)
+    S_H2     = _S("h2",     fontName=FONT_B, fontSize=11.5, leading=15,
+                            textColor=C_NAVY, spaceBefore=8, spaceAfter=3)
+    S_H3     = _S("h3",     fontName=FONT_B, fontSize=10.5, leading=14,
+                            textColor=C_NAVY, spaceBefore=6, spaceAfter=2)
+    S_H4     = _S("h4",     fontName=FONT_B, fontSize=9.5,  leading=13,
+                            textColor=C_BLUE, spaceBefore=4, spaceAfter=2)
+    S_BLABEL = _S("blabel", fontName=FONT_B, fontSize=9.5,  leading=13,
+                            textColor=C_NAVY, spaceAfter=1)
+    S_QUOTE  = _S("quote",  fontName=FONT_I, fontSize=9.5,  leading=14,
+                            textColor=C_GRAY, leftIndent=16, spaceAfter=2)
+    S_IMG    = _S("img",    fontName=FONT_I, fontSize=8.5,  leading=11,
+                            textColor=C_GRAY, alignment=TA_CENTER)
+    S_TH     = _S("th",     fontName=FONT_B, fontSize=8.5,  leading=11,
+                            textColor=C_WHITE)
+    S_TD     = _S("td",     fontName=FONT_N, fontSize=8.5,  leading=11,
+                            textColor=C_BLACK)
+    # Section header
+    S_SEC_T  = _S("sect",   fontName=FONT_B, fontSize=13,   leading=17,
+                            textColor=C_NAVY)
+    S_SEC_R  = _S("secr",   fontName=FONT_N, fontSize=7.5,  leading=10,
+                            textColor=C_GRAY, alignment=TA_RIGHT)
+    # Cover
+    S_BIG_T  = _S("bigt",   fontName=FONT_B, fontSize=22,   leading=27,
+                            textColor=C_NAVY, alignment=TA_CENTER)
+    S_COV_D  = _S("covd",   fontName=FONT_N, fontSize=10,   leading=14,
+                            textColor=C_GRAY, alignment=TA_CENTER)
+    S_COV_FT = _S("covft",  fontName=FONT_N, fontSize=8.5,  leading=11,
+                            textColor=C_GRAY, alignment=TA_CENTER)
+    S_ID_K   = _S("idk",    fontName=FONT_B, fontSize=9.5,  leading=13,
+                            textColor=C_NAVY)
+    S_ID_V   = _S("idv",    fontName=FONT_N, fontSize=9.5,  leading=13,
+                            textColor=C_BLACK)
+
+    # ── PillBadge: flowable dengan rounded rectangle ──────────────────────────
+    class _PillBadge(Flowable):
+        def __init__(self, text, fn, fs, bg, tc,
+                     px=10, py=4, align='LEFT', cw=None):
+            Flowable.__init__(self)
+            self._text = text
+            self._fn = fn;   self._fs = fs
+            self._bg = bg;   self._tc = tc
+            self._px = px;   self._py = py
+            self._align = align
+            tw         = pdfmetrics.stringWidth(text, fn, fs)
+            self._bw   = tw + 2 * px
+            self._bh   = fs + 2 * py
+            self.width = cw or self._bw
+            self.height = self._bh + 2
+
+        def draw(self):
+            c = self.canv
+            bw, bh = self._bw, self._bh
+            x = {'CENTER': (self.width - bw) / 2,
+                 'RIGHT':  self.width - bw}.get(self._align, 0)
+            c.saveState()
+            c.setFillColor(self._bg)
+            c.roundRect(x, 1, bw, bh, bh / 2, stroke=0, fill=1)
+            c.setFillColor(self._tc)
+            c.setFont(self._fn, self._fs)
+            c.drawCentredString(x + bw / 2,
+                                1 + (bh - self._fs) / 2 + 0.5,
+                                self._text)
+            c.restoreState()
+
+    # ── Text cleaner ──────────────────────────────────────────────────────────
+    _RE_SUPPL = re.compile(r"[\U00010000-\U0010FFFF]")
+    _RE_HDR   = re.compile(r"^#{1,4}\s+")
+    # Rentang karakter emoji/piktograf yang dirender dengan font emoji
+    _RE_EMOJI = re.compile(
+        r"[⌀-⏿■-◿☀-➿⬀-⯿"
+        r"\U0001F000-\U0001FAFF]+"
     )
 
-    W = A4[0] - 4 * cm          # lebar efektif halaman
-    BLUE      = colors.HexColor("#1565C0")
-    BLUE_DARK = colors.HexColor("#0D3B86")
-    BLUE_LITE = colors.HexColor("#E3F2FD")
-    GRAY      = colors.HexColor("#546E7A")
+    def _esc(s: str) -> str:
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-    base = getSampleStyleSheet()
-
-    s_title = ParagraphStyle("s_title", parent=base["Normal"],
-        fontSize=13, fontName="Helvetica-Bold",
-        textColor=colors.white, alignment=TA_CENTER)
-
-    s_subtitle = ParagraphStyle("s_subtitle", parent=base["Normal"],
-        fontSize=9, fontName="Helvetica",
-        textColor=colors.HexColor("#BBDEFB"), alignment=TA_CENTER)
-
-    s_section = ParagraphStyle("s_section", parent=base["Normal"],
-        fontSize=10, fontName="Helvetica-Bold",
-        textColor=colors.white, alignment=TA_LEFT)
-
-    s_key = ParagraphStyle("s_key", parent=base["Normal"],
-        fontSize=9.5, fontName="Helvetica-Bold",
-        textColor=BLUE_DARK)
-
-    s_val = ParagraphStyle("s_val", parent=base["Normal"],
-        fontSize=9.5, fontName="Helvetica",
-        textColor=colors.black)
-
-    s_body = ParagraphStyle("s_body", parent=base["Normal"],
-        fontSize=9.5, fontName="Helvetica",
-        textColor=colors.black, alignment=TA_JUSTIFY,
-        leading=14, spaceAfter=2)
-
-    s_footer = ParagraphStyle("s_footer", parent=base["Normal"],
-        fontSize=8, fontName="Helvetica",
-        textColor=GRAY, alignment=TA_CENTER)
-
-    s_h2 = ParagraphStyle("s_h2", parent=base["Normal"],
-        fontSize=10.5, fontName="Helvetica-Bold",
-        textColor=BLUE_DARK, spaceBefore=6, spaceAfter=2)
-
-    s_h3 = ParagraphStyle("s_h3", parent=base["Normal"],
-        fontSize=9.5, fontName="Helvetica-Bold",
-        textColor=BLUE_DARK, spaceBefore=4, spaceAfter=2)
-
-    s_th = ParagraphStyle("s_th", parent=base["Normal"],
-        fontSize=8.5, fontName="Helvetica-Bold",
-        textColor=colors.white, leading=11)
-
-    s_td = ParagraphStyle("s_td", parent=base["Normal"],
-        fontSize=8.5, fontName="Helvetica",
-        textColor=colors.black, leading=11)
-
-    s_img = ParagraphStyle("s_img", parent=base["Normal"],
-        fontSize=8.5, fontName="Helvetica-Oblique",
-        textColor=GRAY, alignment=TA_CENTER)
-
-    # ── Fungsi bantu ──
-    _RE_NON_LATIN  = re.compile("[^\x00-\xFF]")
-    _RE_BOLD       = re.compile(r"\*\*(.*?)\*\*")
-    _RE_ITALIC     = re.compile(r"\*(.*?)\*")
-    _RE_HEADER     = re.compile(r"^#{1,4}\s+")
+    def _emojify(m: "re.Match") -> str:
+        """Render emoji: PNG berwarna → glyph font (monokrom) → teks → buang."""
+        out = []
+        for ch in m.group(0):
+            if ch.isspace():
+                out.append(ch)
+                continue
+            cp  = ord(ch)
+            png = _emoji_png(cp)
+            if png:
+                out.append(f'<img src="{png}" width="11" height="11" valign="-2"/>')
+            elif FONT_E and cp in _EMOJI_CMAP:
+                out.append(f'<font name="{FONT_E}">{ch}</font>')
+            elif cp in _EMOJI_TXT:
+                out.append(_EMOJI_TXT[cp])
+            # else: glyph tidak tersedia → dibuang
+        return "".join(out)
 
     def _clean(text: str) -> str:
-        text = text.translate(_UNICODE_MAP)
-        text = _RE_NON_LATIN.sub("", text)
-        text = text.replace("<br>", "%%BR%%").replace("<br/>", "%%BR%%")
+        """Sanitasi teks output AI untuk ReportLab Paragraph."""
+        text = text.translate(_TYPO_MAP)
+        if not FONT_E:
+            # Tanpa font emoji: ganti ke teks, buang sisa supplementary plane
+            text = text.translate(str.maketrans(_EMOJI_TXT))
+            text = _RE_SUPPL.sub("", text)
         text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        text = text.replace("%%BR%%", "<br/>")
-        text = _RE_BOLD.sub(r"<b>\1</b>", text)
-        text = _RE_ITALIC.sub(r"<i>\1</i>", text)
-        text = _RE_HEADER.sub("", text)
+        text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+        text = re.sub(r"\*(.+?)\*",     r"<i>\1</i>", text)
+        text = re.sub(r"\[_{1,}\]",     "<u>___________</u>", text)
+        text = re.sub(r"_{4,}",         "<u>___________</u>", text)
+        text = _RE_HDR.sub("", text)
+        # Rapikan spasi ganda
+        text = re.sub(r"[ \t]{2,}", " ", text)
+        text = re.sub(r"\(\s+", "(", text)
+        text = re.sub(r"\s+\)", ")", text)
+        # Terakhir: bungkus emoji dengan font emoji (setelah escape & markup)
+        text = _RE_EMOJI.sub(_emojify, text)
+        return text.strip()
+
+    def _preprocess(text: str) -> str:
+        """Bersihkan artefak agent & normalisasi struktur sebelum parsing baris."""
+        if not text:
+            return text
+        text = text.strip()
+        # Buang reasoning CrewAI yang bocor ("Thought: ..." di awal output) —
+        # kadang menempel langsung ke kalimat jawaban tanpa newline.
+        if text.startswith("Thought:"):
+            m = re.match(r"Thought:\s*.*?\.(?=\s*[A-Z\*#\[\d])", text, re.DOTALL)
+            if m:
+                text = text[m.end():].lstrip()
+            else:
+                text = re.sub(r"^Thought:[^\n]*\n?", "", text).lstrip()
+        text = re.sub(r"^Final Answer:\s*", "", text)
+        # Keycap "1️⃣" → "1." agar terbaca sebagai numbered list / heading
+        text = re.sub(r"(\d)️?⃣\s*", r"\1. ", text)
+        # Emoji diamond/separator (🔸🔹🔶🔷…) → pecah jadi bullet baris baru
+        text = re.sub(r"\s*[\U0001F536-\U0001F53B]\s*", "\n- ", text)
         return text
 
-    def _section_bar(letter: str, title: str):
-        t = Table([[Paragraph(f"<b>{letter}. {title.upper()}</b>", s_section)]],
-                  colWidths=[W])
-        t.setStyle(TableStyle([
-            ("BACKGROUND",    (0, 0), (-1, -1), BLUE),
-            ("LEFTPADDING",   (0, 0), (-1, -1), 10),
-            ("RIGHTPADDING",  (0, 0), (-1, -1), 10),
-            ("TOPPADDING",    (0, 0), (-1, -1), 7),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
-            ("BOX",           (0, 0), (-1, -1), 0.5, BLUE_DARK),
-        ]))
-        return t
+    # ── Section bar (orange badge + judul + info kanan + garis biru) ──────────
+    def _sec_bar(letter: str, title: str,
+                 right_top: str = "", right_bot: str = ""):
+        BAD_COL = 2.4 * cm
+        RGT_COL = 3.6 * cm
+        TTL_COL = W - BAD_COL - RGT_COL
 
+        badge = _PillBadge(f"BAGIAN {letter}", FONT_B, 7.5,
+                           C_ORANGE, C_WHITE, px=9, py=4,
+                           align='LEFT', cw=BAD_COL)
+
+        right_txt = _esc(right_top)
+        if right_bot:
+            right_txt += f"<br/>{_esc(right_bot)}"
+
+        hdr = Table(
+            [[badge,
+              Paragraph(f"<b>{_esc(title)}</b>", S_SEC_T),
+              Paragraph(right_txt, S_SEC_R) if right_txt else Spacer(RGT_COL, 0.1*cm)]],
+            colWidths=[BAD_COL, TTL_COL, RGT_COL],
+        )
+        hdr.setStyle(TableStyle([
+            ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
+            ("TOPPADDING",    (0,0), (-1,-1), 3),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 3),
+            ("LEFTPADDING",   (0,0), (-1,-1), 0),
+            ("RIGHTPADDING",  (0,0), (-1,-1), 0),
+        ]))
+        return KeepTogether([
+            Spacer(1, 0.2 * cm),
+            hdr,
+            HRFlowable(width=W, thickness=1.5, color=C_BLUE,
+                       spaceBefore=0.1*cm, spaceAfter=0.15*cm),
+        ])
+
+    # ── Placeholder gambar ────────────────────────────────────────────────────
+    def _img_box(caption: str):
+        ph = Table([[Paragraph(f"[ Gambar: {_clean(caption)} ]", S_IMG)]], colWidths=[W])
+        ph.setStyle(TableStyle([
+            ("BACKGROUND",    (0,0), (-1,-1), C_GRAYL),
+            ("BOX",           (0,0), (-1,-1), 1.0, colors.HexColor("#BDBDBD")),
+            ("ALIGN",         (0,0), (-1,-1), "CENTER"),
+            ("TOPPADDING",    (0,0), (-1,-1), 16),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 16),
+        ]))
+        return ph
+
+    # ── Markdown table renderer ───────────────────────────────────────────────
+    def _md_table(rows: list):
+        if not rows:
+            return None
+        nc   = max(len(r) for r in rows)
+        rows = [r + [""] * (nc - len(r)) for r in rows]
+        cw   = W / nc
+        tbl_data = []
+        for ri, row in enumerate(rows):
+            st = S_TH if ri == 0 else S_TD
+            tbl_data.append([Paragraph(_clean(c), st) for c in row])
+        tbl = Table(tbl_data, colWidths=[cw] * nc, repeatRows=1)
+        tbl.setStyle(TableStyle([
+            ("BACKGROUND",     (0,0), (-1,0),  C_BLUE),
+            ("ROWBACKGROUNDS", (0,1), (-1,-1), [C_WHITE, C_LITE]),
+            ("BOX",            (0,0), (-1,-1), 0.8, C_BLUE),
+            ("INNERGRID",      (0,0), (-1,-1), 0.3, colors.HexColor("#BBDEFB")),
+            ("VALIGN",         (0,0), (-1,-1), "TOP"),
+            ("TOPPADDING",     (0,0), (-1,-1), 4),
+            ("BOTTOMPADDING",  (0,0), (-1,-1), 4),
+            ("LEFTPADDING",    (0,0), (-1,-1), 5),
+            ("RIGHTPADDING",   (0,0), (-1,-1), 5),
+        ]))
+        return tbl
+
+    # ── Content parser ────────────────────────────────────────────────────────
     def _add_content(story: list, text: str):
-        lines = text.split("\n")
+        if not text:
+            return
+        text          = _preprocess(text)
+        lines         = text.split("\n")
+        in_checklist  = False
         i = 0
+
         while i < len(lines):
-            stripped = lines[i].strip()
+            line = lines[i].strip()
             i += 1
 
-            # Skip blank lines
-            if not stripped:
-                story.append(Spacer(1, 0.10 * cm))
+            if not line:
+                story.append(Spacer(1, 0.12 * cm))
+                in_checklist = False
                 continue
 
-            # Skip horizontal rules dan section markers AI (---, --, --\n1 dst)
-            if re.match(r"^-{2,}$", stripped) or stripped == "--":
+            # Garis pemisah (---, --, —) → spacer, tidak dicetak
+            if re.match(r"^-{2,}$", line) or line in ("--", "—", "–"):
+                story.append(Spacer(1, 0.18 * cm))
                 continue
 
-            # Skip angka section artifact dari AI (1, 2, ... 15)
-            if re.match(r"^\d{1,2}$", stripped):
+            # Artefak angka tunggal dari AI
+            if re.match(r"^\d{1,2}$", line):
                 continue
 
-            # Skip baris yang hanya berisi |
-            if stripped == "|":
+            # Baris hanya pipe
+            if line == "|":
                 continue
 
-            # Markdown table block
-            if _is_table_row(stripped):
-                rows = []
-                j = i - 1  # mundur satu karena sudah increment
+            # Sisa tabel terpotong ("| Siswa") → buang pipe, proses sebagai teks
+            if line.startswith("|") and line.count("|") < 2:
+                line = line.strip("|").strip()
+                if not line:
+                    continue
+
+            # Tabel markdown
+            if _is_table_row(line):
+                rows, j = [], i - 1
                 while j < len(lines) and _is_table_row(lines[j].strip()):
                     if not _is_sep_row(lines[j]):
                         row = _parse_row(lines[j])
-                        if any(cell for cell in row):
+                        if any(c for c in row):
                             rows.append(row)
                     j += 1
                 i = j
-
-                if rows:
-                    n_cols = max(len(r) for r in rows)
-                    rows = [r + [""] * (n_cols - len(r)) for r in rows]
-                    col_w = W / n_cols
-                    tbl_data = []
-                    for ri, row in enumerate(rows):
-                        style = s_th if ri == 0 else s_td
-                        tbl_data.append([Paragraph(_clean(c), style) for c in row])
-                    tbl = Table(tbl_data, colWidths=[col_w] * n_cols, repeatRows=1)
-                    tbl.setStyle(TableStyle([
-                        ("BACKGROUND",    (0, 0), (-1, 0),  BLUE),
-                        ("ROWBACKGROUNDS",(0, 1), (-1, -1), [colors.white, BLUE_LITE]),
-                        ("BOX",           (0, 0), (-1, -1), 0.8, BLUE),
-                        ("INNERGRID",     (0, 0), (-1, -1), 0.3, colors.HexColor("#BBDEFB")),
-                        ("VALIGN",        (0, 0), (-1, -1), "TOP"),
-                        ("TOPPADDING",    (0, 0), (-1, -1), 4),
-                        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-                        ("LEFTPADDING",   (0, 0), (-1, -1), 5),
-                        ("RIGHTPADDING",  (0, 0), (-1, -1), 5),
-                    ]))
+                tbl = _md_table(rows)
+                if tbl:
                     story.append(tbl)
                     story.append(Spacer(1, 0.2 * cm))
                 continue
 
-            # Markdown headers (## atau ###)
-            m = re.match(r"^(#{1,4})\s+(.*)", stripped)
+            # Header markdown (##, ###, ####)
+            m = re.match(r"^(#{1,4})\s+(.*)", line)
             if m:
-                level = len(m.group(1))
-                content = re.sub(r"\*\*(.*?)\*\*", r"\1", m.group(2))
-                story.append(Paragraph(_clean(content), s_h2 if level <= 2 else s_h3))
+                level   = len(m.group(1))
+                content = re.sub(r"\*\*(.*?)\*\*", r"\1", m.group(2)).strip()
+                style   = S_H2 if level <= 2 else (S_H3 if level == 3 else S_H4)
+                story.append(Paragraph(_clean(content), style))
+                in_checklist = False
                 continue
 
-            # Placeholder gambar — deteksi **Gambar N:** atau [Gambar N]
-            img_m = re.match(r"^\*{0,2}Gambar\s+\d+[.:)]\*{0,2}\s*(.*)", stripped, re.IGNORECASE)
-            if not img_m:
-                img_m = re.match(r"^\[Gambar\s+\d+\]\s*(.*)", stripped, re.IGNORECASE)
-            if img_m:
-                caption = img_m.group(1).strip() or "Ilustrasi"
-                caption = re.sub(r"\*\*(.*?)\*\*", r"\1", caption)
-                ph = Table(
-                    [[Paragraph(f"[ Gambar: {_clean(caption)} ]", s_img)]],
-                    colWidths=[W],
-                )
-                ph.setStyle(TableStyle([
-                    ("BACKGROUND",    (0, 0), (-1, -1), colors.HexColor("#F5F5F5")),
-                    ("BOX",           (0, 0), (-1, -1), 0.8, colors.HexColor("#BDBDBD")),
-                    ("ALIGN",         (0, 0), (-1, -1), "CENTER"),
-                    ("TOPPADDING",    (0, 0), (-1, -1), 18),
-                    ("BOTTOMPADDING", (0, 0), (-1, -1), 18),
-                ]))
-                story.append(ph)
-                story.append(Spacer(1, 0.2 * cm))
+            # Blockquote markdown (> teks) → italic dengan indent
+            if line.startswith(">"):
+                content = line.lstrip("> ").strip()
+                if content:
+                    story.append(Paragraph(f"<i>{_clean(content)}</i>", S_QUOTE))
                 continue
 
-            # Paragraph biasa
-            story.append(Paragraph(_clean(stripped), s_body))
+            # Placeholder gambar (**Gambar N:** atau [Gambar N])
+            gm = re.match(r"^\*{0,2}[Gg]ambar\s+\d+[.:\)]\*{0,2}\s*(.*)", line)
+            if not gm:
+                gm = re.match(r"^\[[Gg]ambar\s+\d+\]\s*(.*)", line)
+            if gm:
+                cap = re.sub(r"\*\*(.*?)\*\*", r"\1", gm.group(1)).strip() or "Ilustrasi"
+                story.append(_img_box(cap))
+                story.append(Spacer(1, 0.15 * cm))
+                continue
 
-    # ── Story ──
+            # Header checklist (**Checklist:** atau Checklist:)
+            if re.match(r"^\*{0,2}[Cc]hecklist[:\*\s]*$", line):
+                story.append(Paragraph("<b>Checklist:</b>", S_BLABEL))
+                in_checklist = True
+                continue
+
+            # Bold label berdiri sendiri: HANYA "**Label**" / "**Label:**" persis,
+            # tanpa teks lain — regex ketat agar "**A** - *B*" tidak ikut tertangkap
+            bl = re.match(r"^\*\*([^*]+?):?\*\*\s*:?\s*$", line)
+            if bl:
+                raw   = bl.group(1).rstrip(":").strip()
+                label = _clean(raw).strip()
+                # Label kapital semua (judul bagian dari AI) → render sebagai sub-heading
+                # (cek pada teks mentah, sebelum escape &amp; dll)
+                if len(raw) > 3 and raw == raw.upper():
+                    story.append(Paragraph(label, S_H3))
+                else:
+                    story.append(Paragraph(f"<b>{label}:</b>", S_BLABEL))
+                in_checklist = "checklist" in raw.lower()
+                continue
+
+            # Bullet: dimulai dengan - atau *
+            if re.match(r"^[-\*]\s+", line):
+                content = re.sub(r"^[-\*]\s+", "", line)
+                if in_checklist:
+                    story.append(Paragraph(f"[ ] {_clean(content)}", S_CHECK))
+                else:
+                    story.append(Paragraph(f"&#8226; {_clean(content)}", S_BULLET))
+                continue
+
+            # Numbered list (1. 2. atau 1) 2))
+            nm = re.match(r"^(\d+)[.)]\s+(.*)", line)
+            if nm:
+                story.append(Paragraph(
+                    f"<b>{nm.group(1)}.</b>  {_clean(nm.group(2))}", S_NUM))
+                in_checklist = False
+                continue
+
+            # Paragraf biasa
+            story.append(Paragraph(_clean(line), S_BODY))
+            in_checklist = False
+
+    # ── Canvas callbacks ──────────────────────────────────────────────────────
+    def _cover_page(canv, doc):
+        # Cover hanya menggambar background full-page — TANPA footer,
+        # karena cover_bg.png sudah punya ilustrasi bawah sendiri.
+        canv.saveState()
+        if os.path.exists(COVER_BG):
+            canv.drawImage(COVER_BG, 0, 0, PW, PH,
+                           preserveAspectRatio=False, mask="auto")
+        canv.restoreState()
+
+    def _content_page(canv, doc):
+        canv.saveState()
+        if os.path.exists(HEADER):
+            canv.drawImage(HEADER, 0, PH - HEADER_H, PW, HEADER_H,
+                           preserveAspectRatio=False, mask="auto")
+        if os.path.exists(FOOTER):
+            canv.drawImage(FOOTER, 0, 0, PW, FOOTER_H,
+                           preserveAspectRatio=False, mask="auto")
+        canv.setFont(FONT_N, 7)
+        canv.setFillColor(C_GRAY)
+        canv.drawCentredString(PW / 2, FOOTER_H / 2 - 3, f"Halaman {doc.page - 1}")
+        canv.restoreState()
+
+    # ── Page templates (cover vs konten) ──────────────────────────────────────
+    # Frame cover di-inset agar konten berada DI DALAM panel putih cover_bg.png
+    # (panel bg: ±13% margin kiri-kanan, mulai ±14% dari atas, berakhir ±tengah)
+    COV_SIDE = 3.4 * cm                 # margin kiri/kanan konten cover
+    COV_TOP  = 4.3 * cm                 # jarak dari tepi atas halaman
+    COV_BOT  = 13.8 * cm                # batas bawah konten cover
+    W_COV    = PW - 2 * COV_SIDE        # lebar konten cover efektif
+    cover_frame   = Frame(COV_SIDE, COV_BOT,
+                          W_COV, PH - COV_TOP - COV_BOT,
+                          id="cover_f")
+    content_frame = Frame(MARGIN, FOOTER_H + MARGIN,
+                          PW - 2*MARGIN, PH - HEADER_H - FOOTER_H - 2*MARGIN,
+                          id="content_f")
+    cover_tpl   = PageTemplate(id="cover",   frames=[cover_frame],   onPage=_cover_page)
+    content_tpl = PageTemplate(id="content", frames=[content_frame], onPage=_content_page)
+
+    doc = BaseDocTemplate(
+        filename,
+        pagesize=A4,
+        pageTemplates=[cover_tpl, content_tpl],
+    )
+
+    # ── Story ─────────────────────────────────────────────────────────────────
     story = []
 
-    # Header formal RPP
-    header_rows = [
-        [Paragraph("RENCANA PELAKSANAAN PEMBELAJARAN INKLUSIF", s_title)],
-        [Paragraph("Sistem ASIQ &mdash; Adaptive Student Inclusive Learning", s_subtitle)],
-        [Paragraph("Universitas Brawijaya &bull; Capstone Project 2026", s_subtitle)],
-    ]
-    header_tbl = Table(header_rows, colWidths=[W])
-    header_tbl.setStyle(TableStyle([
-        ("BACKGROUND",    (0, 0), (0, 0), BLUE_DARK),
-        ("BACKGROUND",    (0, 1), (0, 2), BLUE),
-        ("ALIGN",         (0, 0), (-1, -1), "CENTER"),
-        ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
-        ("TOPPADDING",    (0, 0), (0, 0), 12),
-        ("BOTTOMPADDING", (0, 0), (0, 0), 10),
-        ("TOPPADDING",    (0, 1), (-1, -1), 4),
-        ("BOTTOMPADDING", (0, 1), (-1, -1), 4),
-        ("BOX",           (0, 0), (-1, -1), 2, BLUE_DARK),
-        ("LINEBELOW",     (0, 0), (0, 0), 1, colors.white),
-    ]))
-    story.append(header_tbl)
-    story.append(Spacer(1, 0.35 * cm))
+    # ══════════════════════════════════════════════════
+    # HALAMAN 1 — COVER
+    # ══════════════════════════════════════════════════
+    tahun_pelajaran = (
+        f"{now.year} / {now.year + 1}" if now.month >= 7
+        else f"{now.year - 1} / {now.year}"
+    )
+    gejala_cover = gejala.split(",")[0].strip()[:45]
 
-    # Tabel identitas siswa (format RPP) — 2 kolom, colon di kolom value
-    gejala_short = gejala if len(gejala) <= 90 else gejala[:87] + "..."
-    identity_rows = [
-        [Paragraph("Satuan Pendidikan",          s_key), Paragraph(": SDN / SLB Inklusif", s_val)],
-        [Paragraph("Kelas / Semester",           s_key), Paragraph(f": {kelas}",           s_val)],
-        [Paragraph("Mata Pelajaran",             s_key), Paragraph(f": {mapel}",            s_val)],
-        [Paragraph("Nama Siswa",                 s_key), Paragraph(f": {nama}",             s_val)],
-        [Paragraph("Kondisi / Kebutuhan Khusus", s_key), Paragraph(f": {gejala_short}",     s_val)],
-        [Paragraph("Tanggal Generate",           s_key), Paragraph(f": {tanggal}",          s_val)],
-    ]
-    id_col = [6.0 * cm, W - 6.0 * cm]
-    identity_tbl = Table(identity_rows, colWidths=id_col)
-    identity_tbl.setStyle(TableStyle([
-        ("BOX",           (0, 0), (-1, -1), 1.2, BLUE),
-        ("INNERGRID",     (0, 0), (-1, -1), 0.4, colors.HexColor("#BBDEFB")),
-        ("ROWBACKGROUNDS",(0, 0), (-1, -1), [colors.white, BLUE_LITE]),
-        ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
-        ("TOPPADDING",    (0, 0), (-1, -1), 5),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-        ("LEFTPADDING",   (0, 0), (-1, -1), 8),
-        ("RIGHTPADDING",  (0, 0), (-1, -1), 8),
-    ]))
-    story.append(identity_tbl)
-    story.append(Spacer(1, 0.45 * cm))
+    story.append(Spacer(1, 0.3 * cm))
 
-    # Bagian A — Profil & Strategi
-    story.append(_section_bar("A", "Profil Siswa & Strategi Adaptasi"))
+    # Badge "MODUL AJAR INKLUSIF" — centered
+    story.append(_PillBadge("MODUL AJAR INKLUSIF",
+                            FONT_B, 8.5, C_ORANGE, C_WHITE,
+                            px=14, py=6, align='CENTER', cw=W_COV))
+    story.append(Spacer(1, 0.55 * cm))
+
+    # Judul besar
+    story.append(Paragraph(f"Belajar {_esc(mapel)}", S_BIG_T))
+    story.append(Spacer(1, 0.3 * cm))
+
+    # Deskripsi singkat
+    story.append(Paragraph(
+        f"Lembar kerja seru untuk {_esc(nama)} &mdash; "
+        f"penuh panduan adaptif, kalimat pendek, "
+        f"dan kegiatan menyenangkan agar makin semangat belajar!",
+        S_COV_D,
+    ))
+    story.append(Spacer(1, 0.7 * cm))
+
+    # Kartu identitas — latar krim, border orange
+    CARD_W = min(12.5 * cm, W_COV - 0.8 * cm)
+    id_rows = [
+        [Paragraph("Nama Siswa",        S_ID_K), Paragraph(_esc(nama),         S_ID_V)],
+        [Paragraph("Kelas",             S_ID_K), Paragraph(_esc(kelas),        S_ID_V)],
+        [Paragraph("Mata Pelajaran",    S_ID_K), Paragraph(_esc(mapel),         S_ID_V)],
+        [Paragraph("Kebutuhan Khusus",  S_ID_K), Paragraph(_esc(gejala_cover), S_ID_V)],
+        [Paragraph("Tahun Pelajaran",   S_ID_K), Paragraph(tahun_pelajaran,    S_ID_V)],
+    ]
+    id_tbl = Table(id_rows,
+                   colWidths=[4.2*cm, CARD_W - 4.2*cm],
+                   hAlign='CENTER')
+    id_tbl.setStyle(TableStyle([
+        ("BACKGROUND",    (0,0), (-1,-1), C_ORANGE_L),
+        ("BOX",           (0,0), (-1,-1), 1.5, C_ORANGE),
+        ("INNERGRID",     (0,0), (-1,-1), 0.5, colors.HexColor("#F0D090")),
+        ("TOPPADDING",    (0,0), (-1,-1), 6),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 6),
+        ("LEFTPADDING",   (0,0), (-1,-1), 12),
+        ("RIGHTPADDING",  (0,0), (-1,-1), 12),
+        ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
+    ]))
+    story.append(id_tbl)
+    story.append(Spacer(1, 0.6 * cm))
+
+    # Footer teks cover
+    story.append(Paragraph(
+        f"SDN / SLB Inklusif &bull; Universitas Brawijaya &bull; {now.year}",
+        S_COV_FT,
+    ))
+
+    story.append(NextPageTemplate("content"))
+    story.append(PageBreak())
+
+    # ══════════════════════════════════════════════════
+    # SECTION A — Profil & Strategi Adaptasi
+    # ══════════════════════════════════════════════════
+    story.append(_sec_bar("A", "Profil Siswa & Strategi Adaptasi",
+                          "Pegangan Guru", "Bukan untuk siswa"))
     story.append(Spacer(1, 0.2 * cm))
     _add_content(story, profiling_out or "(output profiling tidak tersedia)")
-    story.append(Spacer(1, 0.45 * cm))
 
-    # Bagian B — Materi Adaptif
-    story.append(_section_bar("B", "Materi Pembelajaran Adaptif"))
+    # ══════════════════════════════════════════════════
+    # SECTION B — Materi Pembelajaran Adaptif (halaman baru)
+    # ══════════════════════════════════════════════════
+    story.append(PageBreak())
+    story.append(_sec_bar("B", "Materi Pembelajaran Adaptif",
+                          f"{_esc(mapel)} · {_esc(kelas)}",
+                          f"Untuk {_esc(nama)}"))
     story.append(Spacer(1, 0.2 * cm))
     _add_content(story, adaptive_out or "(output materi adaptif tidak tersedia)")
-    story.append(Spacer(1, 0.45 * cm))
 
-    # Bagian C — Laporan Audit
-    story.append(_section_bar("C", "Laporan Audit Inklusivitas"))
-    story.append(Spacer(1, 0.2 * cm))
-    _add_content(story, insight_out or "(output laporan audit tidak tersedia)")
-    story.append(Spacer(1, 0.5 * cm))
-
-    # Footer
-    story.append(HRFlowable(width=W, thickness=1, color=BLUE))
-    story.append(Spacer(1, 0.2 * cm))
-    story.append(Paragraph(
-        f"Generated by ASIQ &bull; Universitas Brawijaya &bull; {tanggal}",
-        s_footer
-    ))
+    # Section C tidak dicetak — tersedia di API response & 03_Laporan_Audit.md
 
     doc.build(story)
     return filename

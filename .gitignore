@@ -37,3 +37,5 @@ huggingface.md
 # OS
 .DS_Store
 Thumbs.db
+
+.claude/
