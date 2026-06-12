@@ -659,6 +659,32 @@ def generate_pdf(data: dict, profiling_out: str, adaptive_out: str, insight_out:
         # "Final Answer:" paling andal — ambil semua SETELAH kemunculan terakhir
         if "Final Answer:" in text:
             text = text.split("Final Answer:")[-1].lstrip()
+        # Bocoran JSON tool-call di awal output: {"query": {...}}{"result": "..."}<konten>
+        # Buang setiap objek JSON utuh di depan (kurung kurawal diseimbangkan,
+        # kurung di dalam string di-skip) sampai ketemu konten asli.
+        while text.startswith("{"):
+            depth, in_str, esc, end = 0, False, False, -1
+            for i, ch in enumerate(text):
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = not in_str
+                elif not in_str:
+                    if ch == "{":
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                        if depth == 0:
+                            end = i
+                            break
+            if end == -1:
+                break   # JSON tidak utuh — biarkan, jangan buang konten
+            text = text[end + 1:].lstrip()
+        # Baris skor mesin (READABILITY_SCORE: 78) untuk parser API — jangan dicetak
+        text = re.sub(r"^\**\s*(READABILITY_SCORE|INCLUSIVITY_SCORE)\s*[:=][^\n]*$", "",
+                      text, flags=re.MULTILINE | re.IGNORECASE)
         # Jejak ReAct bocor di awal output: "Thought: ... Observation: {json}
         # Thought: ... <jawaban asli>". Buang semuanya sampai konten asli —
         # konten asli dikenali dari marker markdown pertama (** / # / | / -)

@@ -183,14 +183,37 @@ def _upload_to_s3(local_path: str, s3_key: str) -> Optional[str]:
 # ── Parse skor dari output insight agent ─────────────────────────────────────
 
 def _parse_scores(insight_out: str) -> tuple[int, int]:
-    readability = 0
-    wcag = 0
-    m = re.search(r"[Rr]eadability\s+[Ss]core.*?(\d{1,3})", insight_out)
-    if m:
-        readability = min(int(m.group(1)), 100)
-    m = re.search(r"[Ss]kor\s+[Ii]nklusivitas.*?(\d{1,3})", insight_out)
-    if m:
-        wcag = min(int(m.group(1)), 100)
+    """Ambil skor dari output insight agent.
+
+    Prioritas: baris format wajib READABILITY_SCORE:/INCLUSIVITY_SCORE: (diminta
+    eksplisit di tasks.yaml). Fallback: frasa bebas dalam EN/ID — jarak frasa→angka
+    dibatasi 60 karakter non-digit dan boleh melewati baris, karena model sering
+    menaruh angka di baris berikutnya."""
+    def _cari(*patterns: str) -> int:
+        for p in patterns:
+            m = re.search(p, insight_out, re.IGNORECASE | re.DOTALL)
+            if m:
+                return min(int(m.group(1)), 100)
+        return 0
+
+    # Urutan penting: pola spesifik dulu (format wajib → "n / 100" → skor bold)
+    # baru pola longgar, agar angka nyasar ("WCAG 2.2") tidak tertangkap duluan.
+    readability = _cari(
+        r"READABILITY_SCORE\s*[:=]\s*\**\s*(\d{1,3})",
+        r"readability\s*score\D{0,60}?(\d{1,3})\s*/\s*100",
+        # Tabel: "| **Readability Score** (...WCAG 2.2...) | **88** |" — gap boleh
+        # mengandung angka versi, skornya dikenali dari bold
+        r"readability\s*score.{0,120}?\*\*\s*(\d{1,3})",
+        r"readability\s*score\D{0,60}?(\d{1,3})",
+        r"skor\s+keterbacaan\D{0,60}?(\d{1,3})",
+    )
+    wcag = _cari(
+        r"INCLUSIVITY_SCORE\s*[:=]\s*\**\s*(\d{1,3})",
+        r"skor\s+inklusivitas\D{0,60}?(\d{1,3})\s*/\s*100",
+        r"skor\s+inklusivitas.{0,120}?\*\*\s*(\d{1,3})",
+        r"skor\s+inklusivitas\D{0,60}?(\d{1,3})",
+        r"inklusivitas\s*[:\(]\D{0,40}?(\d{1,3})",
+    )
     return readability, wcag
 
 
@@ -365,11 +388,26 @@ def _run_pipeline(job_id: str, data: dict, doc_bytes: Optional[bytes], doc_ext: 
             adaptive_out  = ""
             insight_out   = ""
 
-        # Step 3 — generate PDF
+        # Step 3 — buat ilustrasi Section B (jika gagal, PDF tetap dibuat tanpa gambar)
+        _update_job(job_id, {"step": "Membuat ilustrasi materi..."})
+        illustrations = []
+        try:
+            from main import _fetch_image_prompts, _generate_illustration
+            for prompt in _fetch_image_prompts(
+                    data["mata_pelajaran"], data["kelas"], data.get("gejala", "")):
+                img = _generate_illustration(prompt)
+                if img:
+                    illustrations.append(img)
+            log.info("Job %s: %d ilustrasi siap.", job_id, len(illustrations))
+        except Exception as e:
+            log.warning("Job %s: ilustrasi gagal (%s) — lanjut tanpa gambar.", job_id, e)
+
+        # Step 4 — generate PDF
         _update_job(job_id, {"step": "Membuat PDF RPP Inklusif..."})
         output_dir = _create_output_dir(data["nama_siswa"])
         _save_markdown_files(output_dir, profiling_out, adaptive_out, insight_out)
-        pdf_path = generate_pdf(data, profiling_out, adaptive_out, insight_out, output_dir)
+        pdf_path = generate_pdf(data, profiling_out, adaptive_out, insight_out, output_dir,
+                                illustrations=illustrations)
         log.info("Job %s: PDF dibuat di %s", job_id, pdf_path)
 
         # Step 4 — upload ke S3

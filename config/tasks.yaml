@@ -20,6 +20,11 @@ insight_task:
   description: >
     Evaluasi teks materi pembelajaran final yang dihasilkan dari tugas sebelumnya.
     Berikan perkiraan "Readability Score" (Skor 0-100) dan nilai apakah teks tersebut sudah memenuhi standar inklusivitas[cite: 1501]. Jika ada kata atau kalimat yang masih terlalu rumit, sebutkan dan berikan saran perbaikannya.
+    WAJIB: akhiri laporan dengan tepat dua baris berformat persis seperti ini
+    (angka saja, tanpa /100, tanpa bold, tanpa tambahan apa pun):
+    READABILITY_SCORE: <angka 0-100>
+    INCLUSIVITY_SCORE: <angka 0-100>
   expected_output: >
     Laporan audit akhir yang berisi: Skor Inklusivitas, analisis kelebihan teks, dan rekomendasi perbaikan (jika ada).
+    Diakhiri dua baris READABILITY_SCORE: dan INCLUSIVITY_SCORE: sesuai format wajib.
   agent: insight_agent
