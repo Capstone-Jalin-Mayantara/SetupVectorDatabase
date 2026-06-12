@@ -185,9 +185,11 @@ def _fetch_image_prompts(mapel: str, kelas: str, kebutuhan: str) -> list:
     import json
     try:
         import litellm
+        _or_key = os.getenv("OPENROUTER_API_KEY", "")
         resp = litellm.completion(
-            api_key=os.getenv("GROQ_API_KEY", ""),
-            model="groq/openai/gpt-oss-120b",   # model sama dgn pipeline utama
+            api_key=_or_key or os.getenv("GROQ_API_KEY", ""),
+            model=("openrouter/openai/gpt-oss-120b" if _or_key
+                   else "groq/openai/gpt-oss-120b"),   # model sama dgn pipeline utama
             messages=[{"role": "user", "content": (
                 f"Create 2 short English image prompts for illustrations in a children's PDF.\n"
                 f"Topic context: {mapel} | Grade: {kelas} | Special needs: {kebutuhan}\n\n"

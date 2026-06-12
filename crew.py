@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import logging
 from dotenv import load_dotenv
@@ -17,15 +18,34 @@ MODEL_NAME = "intfloat/multilingual-e5-base"
 DB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "database", "chroma_db")
 CACHE_TTL = 3600  # 1 jam
 
-# Delay antar task/step — turunkan jika Groq plan sudah tier berbayar
-_TASK_DELAY  = int(os.getenv("GROQ_TASK_DELAY",  "30"))   # detik antar task (default 30, was 60)
-_STEP_DELAY  = int(os.getenv("GROQ_STEP_DELAY",  "8"))    # detik antar step (default 8, was 30)
+# Provider LLM: OpenRouter (berbayar, tanpa limit TPM/TPD ketat) jika key tersedia,
+# fallback ke Groq free tier (TPM 8k, TPD 500k).
+_OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY", "")
+
+# Delay antar task/step — hanya perlu untuk Groq free tier yang gampang throttle.
+# OpenRouter pay-as-you-go tidak butuh delay.
+_default_task_delay = "0" if _OPENROUTER_KEY else "30"
+_default_step_delay = "0" if _OPENROUTER_KEY else "8"
+_TASK_DELAY  = int(os.getenv("GROQ_TASK_DELAY",  _default_task_delay))
+_STEP_DELAY  = int(os.getenv("GROQ_STEP_DELAY",  _default_step_delay))
 _MAX_RETRIES = int(os.getenv("GROQ_MAX_RETRIES", "3"))    # retry jika rate-limited
 
-local_llm = LLM(
-    model="groq/openai/gpt-oss-120b",
-    api_key=os.environ.get("GROQ_API_KEY"),
-)
+# Batas panjang materi yang dikirim ke LLM. Free tier Groq: TPM 8.000 token —
+# dokumen 72k karakter ≈ 19k token langsung ditolak (413). 12k char ≈ 3-4k token.
+_MATERI_MAX_CHARS = int(os.getenv("MATERI_MAX_CHARS", "12000"))
+
+if _OPENROUTER_KEY:
+    local_llm = LLM(
+        model="openrouter/openai/gpt-oss-120b",
+        api_key=_OPENROUTER_KEY,
+    )
+    log.info("LLM provider: OpenRouter (gpt-oss-120b)")
+else:
+    local_llm = LLM(
+        model="groq/openai/gpt-oss-120b",
+        api_key=os.environ.get("GROQ_API_KEY"),
+    )
+    log.info("LLM provider: Groq free tier (gpt-oss-120b)")
 
 # Singleton embedding model — di-load sekali saat modul pertama kali diimport.
 # Hindari reload berulang yang memakan waktu 15-30 detik per request.
@@ -185,15 +205,82 @@ class AsiqAgents():
         )
 
 
+def _pangkas_materi(teks: str) -> str:
+    """Pangkas dokumen materi agar muat di limit token Groq.
+
+    Dokumen guru sering berisi beberapa modul ajar sekaligus (struktur A-R
+    berulang) plus boilerplate yang tidak berguna untuk adaptasi. Tiga lapis:
+    1. Ambil modul pertama saja jika 'MODUL AJAR' muncul lebih dari sekali.
+    2. Buang bagian Daftar Pustaka/Glosarium/Bahan Bacaan/LKPD/tanda tangan.
+    3. Potong keras di batas paragraf maksimal _MATERI_MAX_CHARS."""
+    if not teks:
+        return teks
+
+    # 1. Modul berulang → modul pertama saja
+    matches = list(re.finditer(r"MODUL\s+AJAR", teks, re.IGNORECASE))
+    if len(matches) > 1:
+        teks = teks[:matches[1].start()]
+
+    # 2. Buang section boilerplate (dari headingnya sampai heading huruf berikutnya)
+    teks = re.sub(
+        r"(?ms)^\s*[A-Z]\.\s*(Bahan Bacaan|Glosarium|Daftar Pustaka|LKPD)\b.*?(?=^\s*[A-Z]\.\s|\Z)",
+        "", teks)
+    # Blok tanda tangan: "Mengetahui ... NIP. xxxx"
+    teks = re.sub(r"(?ms)^\s*Mengetahui\b.*?NIP\.?\s*[\d ]+\s*$", "", teks)
+
+    # 3. Potong di batas paragraf
+    teks = teks.strip()
+    if len(teks) > _MATERI_MAX_CHARS:
+        potong = teks.rfind("\n\n", 0, _MATERI_MAX_CHARS)
+        if potong < _MATERI_MAX_CHARS // 2:
+            potong = _MATERI_MAX_CHARS
+        teks = teks[:potong].rstrip() + "\n\n[Materi dipangkas otomatis agar muat dalam batas token]"
+    return teks
+
+
+def _cek_output_rusak(hasil) -> str:
+    """Return nama task pertama yang output-nya tidak valid, atau '' jika semua OK.
+
+    Output dianggap rusak jika terlalu pendek — gejala model menjawab
+    'We will call the tool.' dkk. sebagai final answer tanpa konten."""
+    try:
+        outputs = hasil.tasks_output
+    except Exception:
+        return ""
+    for t in outputs:
+        raw = (getattr(t, "raw", "") or "").strip()
+        if len(raw) < 300:
+            return getattr(t, "name", None) or getattr(t, "description", "")[:40] or "?"
+    return ""
+
+
 def run_crew_with_retry(inputs: dict) -> object:
     """Jalankan crew dengan retry otomatis.
     Menangani: rate limit Groq (429) dan error intermiten 'tool_use_failed'
     (model gpt-oss kadang mengeluarkan tool call saat tool_choice=none)."""
     import random
+
+    if inputs.get("materi_mentah"):
+        asli = len(inputs["materi_mentah"])
+        inputs = {**inputs, "materi_mentah": _pangkas_materi(inputs["materi_mentah"])}
+        if len(inputs["materi_mentah"]) < asli:
+            log.info("Materi dipangkas: %d → %d karakter (limit token Groq).",
+                     asli, len(inputs["materi_mentah"]))
+
     last_exc = None
     for attempt in range(1, _MAX_RETRIES + 1):
         try:
-            return AsiqAgents().crew().kickoff(inputs=inputs)
+            hasil = AsiqAgents().crew().kickoff(inputs=inputs)
+            rusak = _cek_output_rusak(hasil)
+            if rusak:
+                # Model kadang menjawab "We will call the tool." sebagai final answer
+                # (gagal format ReAct) — hasilnya sampah pendek. Ulangi pipeline.
+                log.warning("Output task '%s' tidak valid (attempt %d/%d) — pipeline diulang...",
+                            rusak, attempt, _MAX_RETRIES)
+                last_exc = RuntimeError(f"Output task '{rusak}' tidak valid/terlalu pendek")
+                time.sleep(2)
+                continue
+            return hasil
         except Exception as exc:
             msg = str(exc).lower()
             if "rate limit" in msg or "429" in msg or "too many" in msg:
