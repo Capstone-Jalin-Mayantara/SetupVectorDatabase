@@ -131,10 +131,14 @@ class AsiqAgents():
     def profiling_agent(self) -> Agent:
         # cek_cache_profiling dipanggil PERTAMA — jika cache hit, tidak perlu panggil LLM lagi.
         # simpan_cache_profiling dipanggil di AKHIR untuk menyimpan strategi baru ke Redis.
+        # Saat Redis down, tool cache tidak diberikan — mengurangi tool call sia-sia
+        # yang memicu error "tool_use_failed" di model gpt-oss Groq.
+        _tools = ([cek_cache_profiling, cari_pedoman, simpan_cache_profiling]
+                  if REDIS_ENABLED else [cari_pedoman])
         return Agent(
             config=self.agents_config['profiling_agent'],
             llm=local_llm,
-            tools=[cek_cache_profiling, cari_pedoman, simpan_cache_profiling],
+            tools=_tools,
             verbose=True,
         )
 
@@ -182,7 +186,9 @@ class AsiqAgents():
 
 
 def run_crew_with_retry(inputs: dict) -> object:
-    """Jalankan crew dengan exponential backoff jika Groq rate-limit (429)."""
+    """Jalankan crew dengan retry otomatis.
+    Menangani: rate limit Groq (429) dan error intermiten 'tool_use_failed'
+    (model gpt-oss kadang mengeluarkan tool call saat tool_choice=none)."""
     import random
     last_exc = None
     for attempt in range(1, _MAX_RETRIES + 1):
@@ -193,6 +199,12 @@ def run_crew_with_retry(inputs: dict) -> object:
             if "rate limit" in msg or "429" in msg or "too many" in msg:
                 wait = (2 ** attempt) + random.uniform(0, 2)
                 log.warning("Rate limit hit (attempt %d/%d). Retry dalam %.1fs...", attempt, _MAX_RETRIES, wait)
+                time.sleep(wait)
+                last_exc = exc
+            elif "tool_use_failed" in msg or "tool choice is none" in msg:
+                wait = 3 + random.uniform(0, 2)
+                log.warning("Groq tool_use_failed (attempt %d/%d) — error intermiten, retry dalam %.1fs...",
+                            attempt, _MAX_RETRIES, wait)
                 time.sleep(wait)
                 last_exc = exc
             else:

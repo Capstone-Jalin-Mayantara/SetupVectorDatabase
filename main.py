@@ -130,6 +130,100 @@ def _emoji_png(cp: int):
         return None
 
 
+# ── Illustration cache (Pollinations.ai) ──────────────────────────────────────
+_IMG_DIR    = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "assets", "img_cache")
+_POLL_HOST  = "gen.pollinations.ai"
+_POLL_TOKEN = os.getenv("POLLINATIONS_TOKEN", "")
+_img_failed: set = set()
+
+
+# Suffix anti-teks — SELALU ditambahkan di sisi kode, tidak bergantung output Groq.
+# FLUX cenderung menggambar tulisan bila prompt menyebut tema pelajaran; suffix ini
+# + prompt yang murni visual (tanpa menyebut nama mapel) menekan kemunculan teks.
+_IMG_NO_TEXT = (", wordless textless illustration, absolutely no text, no words, "
+                "no letters, no captions, no labels, no signage, no typography, "
+                "no writing anywhere, plain background")
+
+
+def _generate_illustration(prompt: str, width: int = 800, height: int = 500):
+    """Download ilustrasi dari Pollinations, cache di assets/img_cache/. Return path atau None."""
+    import hashlib, http.client, urllib.parse
+    global _img_failed
+    prompt = prompt.rstrip(". ") + _IMG_NO_TEXT
+    key  = hashlib.md5(prompt.encode()).hexdigest()
+    path = os.path.join(_IMG_DIR, f"{key}.jpg")
+    if os.path.exists(path) and os.path.getsize(path) > 5000:
+        return path
+    if key in _img_failed:
+        return None
+    try:
+        os.makedirs(_IMG_DIR, exist_ok=True)
+        encoded = urllib.parse.quote(prompt)
+        p = f"/image/{encoded}?model=flux&width={width}&height={height}&seed=-1&nologo=true"
+        headers = {"User-Agent": "ASIQ-PDF/1.0"}
+        if _POLL_TOKEN:
+            headers["Authorization"] = f"Bearer {_POLL_TOKEN}"
+        conn = http.client.HTTPSConnection(_POLL_HOST, timeout=60)
+        conn.request("GET", p, headers=headers)
+        resp = conn.getresponse()
+        data = resp.read()
+        conn.close()
+        if resp.status == 200 and len(data) > 5000:
+            with open(path, "wb") as f:
+                f.write(data)
+            return path
+        _img_failed.add(key)
+        return None
+    except Exception:
+        _img_failed.add(key)
+        return None
+
+
+def _fetch_image_prompts(mapel: str, kelas: str, kebutuhan: str) -> list:
+    """Minta Groq buat 2 prompt ilustrasi dalam bahasa Inggris. Fallback ke prompt statis."""
+    import json
+    try:
+        import litellm
+        resp = litellm.completion(
+            api_key=os.getenv("GROQ_API_KEY", ""),
+            model="groq/openai/gpt-oss-120b",   # model sama dgn pipeline utama
+            messages=[{"role": "user", "content": (
+                f"Create 2 short English image prompts for illustrations in a children's PDF.\n"
+                f"Topic context: {mapel} | Grade: {kelas} | Special needs: {kebutuhan}\n\n"
+                f"STRICT RULES — the image generator draws ugly garbled text whenever "
+                f"a prompt hints at words, so:\n"
+                f"- Describe ONLY a visual scene: people, objects, actions, expressions, colors.\n"
+                f"- NEVER mention the subject name, titles, posters, signs, alphabets, "
+                f"letters, blackboards/whiteboards with writing, or open books with visible pages.\n"
+                f"- Good example: 'happy children sitting in a circle listening to their "
+                f"teacher telling a story, flat cartoon style, white background'\n"
+                f"- Prompt 1: children doing a fun activity related to the topic (visually).\n"
+                f"- Prompt 2: colorful objects/scene representing the topic (visually).\n"
+                f"- Style: flat cartoon, colorful, child-friendly, white background.\n"
+                f"Return ONLY a JSON array: [\"prompt1\", \"prompt2\"]"
+            )}],
+            max_tokens=1200,   # gpt-oss = reasoning model, butuh ruang utk berpikir
+            temperature=0.7,
+        )
+        text = resp.choices[0].message.content.strip()
+        m = re.search(r'\[.*?\]', text, re.DOTALL)
+        if m:
+            prompts = json.loads(m.group(0))
+            return [p for p in prompts if isinstance(p, str)][:2]
+    except Exception as e:
+        print(f"  [IMG] Groq prompt gagal: {e}")
+    # Fallback statis: deskripsi visual murni — tidak menyebut nama mapel
+    # supaya model gambar tidak terpancing menulis judul.
+    return [
+        "Cheerful Indonesian elementary school children sitting in a classroom, "
+        "raising hands and smiling at their teacher, flat cartoon style, colorful, "
+        "child-friendly, white background",
+        "Happy children playing and listening to a story together under a tree, "
+        "colorful flat cartoon illustration, child-friendly, white background",
+    ]
+
+
 # ── Document loader ───────────────────────────────────────────────────────────
 
 def _list_input_files() -> list:
@@ -250,7 +344,7 @@ def kumpulkan_input_guru() -> dict:
 # ── Crew ──────────────────────────────────────────────────────────────────────
 
 def jalankan_crew(data: dict):
-    from crew import AsiqAgents
+    from crew import run_crew_with_retry
 
     print()
     print("🚀 Menjalankan pipeline ASIQ...")
@@ -259,7 +353,7 @@ def jalankan_crew(data: dict):
     print("   [3/3] Insight Agent    → audit inklusivitas")
     print()
 
-    return AsiqAgents().crew().kickoff(inputs={
+    return run_crew_with_retry(inputs={
         "profil_siswa": _build_profil(data),
         "materi_mentah": data["materi_mentah"],
     })
@@ -304,7 +398,7 @@ def _save_markdown_files(output_dir: str, profiling_out: str, adaptive_out: str,
 
 # ── PDF Generator ─────────────────────────────────────────────────────────────
 
-def generate_pdf(data: dict, profiling_out: str, adaptive_out: str, insight_out: str, output_dir: str = ".") -> str:
+def generate_pdf(data: dict, profiling_out: str, adaptive_out: str, insight_out: str, output_dir: str = ".", illustrations: list = None) -> str:
     """
     Generate PDF RPP Inklusif.
     Dicetak ke PDF : Section A (Profil & Strategi) + Section B (Materi Adaptif).
@@ -539,7 +633,10 @@ def generate_pdf(data: dict, profiling_out: str, adaptive_out: str, insight_out:
             text = text.translate(str.maketrans(_EMOJI_TXT))
             text = _RE_SUPPL.sub("", text)
         text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        # <br> dari AI (sering dipakai di sel tabel) → line break ReportLab
+        text = re.sub(r"&lt;br\s*/?&gt;", "<br/>", text, flags=re.IGNORECASE)
         text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+        text = text.replace("**", "")   # sisa ** tak berpasangan: jangan tercetak
         text = re.sub(r"\*(.+?)\*",     r"<i>\1</i>", text)
         text = re.sub(r"\[_{1,}\]",     "<u>___________</u>", text)
         text = re.sub(r"_{4,}",         "<u>___________</u>", text)
@@ -557,15 +654,35 @@ def generate_pdf(data: dict, profiling_out: str, adaptive_out: str, insight_out:
         if not text:
             return text
         text = text.strip()
-        # Buang reasoning CrewAI yang bocor ("Thought: ..." di awal output) —
-        # kadang menempel langsung ke kalimat jawaban tanpa newline.
-        if text.startswith("Thought:"):
-            m = re.match(r"Thought:\s*.*?\.(?=\s*[A-Z\*#\[\d])", text, re.DOTALL)
+        # "Final Answer:" paling andal — ambil semua SETELAH kemunculan terakhir
+        if "Final Answer:" in text:
+            text = text.split("Final Answer:")[-1].lstrip()
+        # Jejak ReAct bocor di awal output: "Thought: ... Observation: {json}
+        # Thought: ... <jawaban asli>". Buang semuanya sampai konten asli —
+        # konten asli dikenali dari marker markdown pertama (** / # / | / -)
+        # setelah "Thought:" TERAKHIR.
+        if text.startswith(("Thought:", "Observation:")):
+            idx  = text.rfind("Thought:")
+            tail = text[idx:] if idx != -1 else text
+            m = re.search(r"(\*\*|\n#{1,4}\s|\n\||\n- )", tail)
             if m:
-                text = text[m.end():].lstrip()
+                text = tail[m.start():].lstrip()
             else:
-                text = re.sub(r"^Thought:[^\n]*\n?", "", text).lstrip()
-        text = re.sub(r"^Final Answer:\s*", "", text)
+                # fallback: buang baris pertama (kalimat thought) saja
+                text = re.sub(r"^(Thought|Observation):[^\n]*\n?", "", tail).lstrip()
+        # Echo instruksi panjang ("*(Total <= 200 kata)*") tidak perlu dicetak
+        text = re.sub(r"^\**\(Total[^\n)]*kata\)\**[ \t]*$", "", text,
+                      flags=re.MULTILINE | re.IGNORECASE)
+        # Bold judul 2 baris ("** judul\nbaris dua**") → bold per baris.
+        # Regex SANGAT ketat: pembuka harus di awal baris, penutup di akhir
+        # baris berikutnya, tanpa |/#/asterisk di dalamnya — supaya **
+        # nyasar (tak berpasangan) tidak dijodohkan lintas-bagian dan
+        # merusak tabel/heading.
+        text = re.sub(
+            r"^\*\* ?([^*\n|#]{1,100})\n([^*\n|#]{1,100}?) ?\*\*[ \t]*$",
+            lambda m: f"**{m.group(1).strip()}**\n**{m.group(2).strip()}**",
+            text, flags=re.MULTILINE,
+        )
         # Keycap "1️⃣" → "1." agar terbaca sebagai numbered list / heading
         text = re.sub(r"(\d)️?⃣\s*", r"\1. ", text)
         # Emoji diamond/separator (🔸🔹🔶🔷…) → pecah jadi bullet baris baru
@@ -732,16 +849,18 @@ def generate_pdf(data: dict, profiling_out: str, adaptive_out: str, insight_out:
 
             # Bold label berdiri sendiri: HANYA "**Label**" / "**Label:**" persis,
             # tanpa teks lain — regex ketat agar "**A** - *B*" tidak ikut tertangkap
-            bl = re.match(r"^\*\*([^*]+?):?\*\*\s*:?\s*$", line)
+            bl = re.match(r"^\*\*([^*]+?)(:)?\*\*\s*(:)?\s*$", line)
             if bl:
-                raw   = bl.group(1).rstrip(":").strip()
-                label = _clean(raw).strip()
+                raw       = bl.group(1).rstrip(":").strip()
+                had_colon = bool(bl.group(2) or bl.group(3))
+                label     = _clean(raw).strip()
                 # Label kapital semua (judul bagian dari AI) → render sebagai sub-heading
                 # (cek pada teks mentah, sebelum escape &amp; dll)
                 if len(raw) > 3 and raw == raw.upper():
                     story.append(Paragraph(label, S_H3))
                 else:
-                    story.append(Paragraph(f"<b>{label}:</b>", S_BLABEL))
+                    suffix = ":" if had_colon else ""
+                    story.append(Paragraph(f"<b>{label}{suffix}</b>", S_BLABEL))
                 in_checklist = "checklist" in raw.lower()
                 continue
 
@@ -894,7 +1013,42 @@ def generate_pdf(data: dict, profiling_out: str, adaptive_out: str, insight_out:
                           f"{_esc(mapel)} · {_esc(kelas)}",
                           f"Untuk {_esc(nama)}"))
     story.append(Spacer(1, 0.2 * cm))
-    _add_content(story, adaptive_out or "(output materi adaptif tidak tersedia)")
+
+    # Ilustrasi Section B: gambar 1 di awal, gambar 2 di tengah konten
+    imgs = illustrations or []
+    img1 = imgs[0] if len(imgs) > 0 else None
+    img2 = imgs[1] if len(imgs) > 1 else None
+
+    if img1:
+        story.append(Spacer(1, 0.2 * cm))
+        story.append(Image(img1, width=14*cm, height=8.75*cm, hAlign='CENTER'))
+        story.append(Spacer(1, 0.4 * cm))
+
+    content_b = adaptive_out or "(output materi adaptif tidak tersedia)"
+
+    if img2:
+        # Cari batas paragraf terdekat dengan tengah konten — hindari memotong
+        # tabel markdown (blok yang diawali '|').
+        blocks = content_b.split("\n\n")
+        split_at = None
+        if len(blocks) >= 4:
+            mid = len(blocks) // 2
+            for j in list(range(mid, len(blocks))) + list(range(mid - 1, 0, -1)):
+                if not blocks[j].lstrip().startswith("|"):
+                    split_at = j
+                    break
+        if split_at:
+            _add_content(story, "\n\n".join(blocks[:split_at]))
+            story.append(Spacer(1, 0.4 * cm))
+            story.append(Image(img2, width=12*cm, height=7.5*cm, hAlign='CENTER'))
+            story.append(Spacer(1, 0.4 * cm))
+            _add_content(story, "\n\n".join(blocks[split_at:]))
+        else:
+            _add_content(story, content_b)
+            story.append(Spacer(1, 0.5 * cm))
+            story.append(Image(img2, width=12*cm, height=7.5*cm, hAlign='CENTER'))
+    else:
+        _add_content(story, content_b)
 
     # Section C tidak dicetak — tersedia di API response & 03_Laporan_Audit.md
 
@@ -943,7 +1097,24 @@ def main():
         insight_out   = ""
 
     _save_markdown_files(output_dir, profiling_out, adaptive_out, insight_out)
-    pdf_file = generate_pdf(data, profiling_out, adaptive_out, insight_out, output_dir)
+
+    # Generate ilustrasi Section B via Groq + Pollinations
+    print("\n  Membuat ilustrasi untuk Section B...")
+    img_prompts = _fetch_image_prompts(
+        data["mata_pelajaran"], data["kelas"], data["gejala"]
+    )
+    illustrations = []
+    for i, prompt in enumerate(img_prompts, 1):
+        print(f"  [{i}/{len(img_prompts)}] {prompt[:70]}...")
+        path = _generate_illustration(prompt)
+        if path:
+            illustrations.append(path)
+            print(f"  OK: {os.path.basename(path)}")
+        else:
+            print(f"  SKIP: gagal download (PDF tetap dibuat)")
+
+    pdf_file = generate_pdf(data, profiling_out, adaptive_out, insight_out, output_dir,
+                            illustrations=illustrations)
 
     tampilkan_hasil(hasil, output_dir)
     print(f"📄 PDF  : {pdf_file}")
