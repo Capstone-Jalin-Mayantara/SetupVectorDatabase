@@ -19,6 +19,9 @@ redis_client: Optional[redis_lib.Redis] = None
 
 _REDIS_RETRIES = 2
 _REDIS_TIMEOUT = 3  # detik
+# ElastiCache Serverless WAJIB TLS — set REDIS_SSL=true di .env.
+# Tanpa TLS, PING ke endpoint serverless menggantung tanpa balasan.
+_REDIS_SSL = os.getenv("REDIS_SSL", "false").strip().lower() in ("1", "true", "yes")
 
 
 def _init_redis() -> tuple[bool, Optional[redis_lib.Redis]]:
@@ -32,11 +35,10 @@ def _init_redis() -> tuple[bool, Optional[redis_lib.Redis]]:
             client = redis_lib.Redis(
                 host=host,
                 port=int(os.getenv("REDIS_PORT", 6379)),
+                ssl=_REDIS_SSL,
                 decode_responses=True,
                 socket_connect_timeout=_REDIS_TIMEOUT,
                 socket_timeout=_REDIS_TIMEOUT,
-                retry_on_timeout=True,
-                health_check_interval=30,
             )
             client.ping()
             log.info("Redis terhubung di %s:%s", host, os.getenv("REDIS_PORT", 6379))
